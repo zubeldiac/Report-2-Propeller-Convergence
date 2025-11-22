@@ -1,0 +1,327 @@
+#First converge Cq
+#Then look at velocity profiles some time downstream
+#Do Richardson extrapolation
+
+
+import FLOWUnsteady as uns
+import FLOWVLM as vlm
+import FLOWVPM as vpm
+#///////////////////////////////////////////////////////
+using CSV   # For reading the simulation data
+using DataFrames # For handling CSV data
+using Printf   # For formatted output
+#/////////////////////////////////////////////////////////
+
+function convergence(N; run_id=1)
+
+    run_name        = "propeller-convergence-N$(N)"        # Unique name
+    save_path       = "propeller-convergence-N$(N)"                  # Where to save this simulation
+
+    # ----------------- GEOMETRY PARAMETERS ----------------------------------------
+
+    # Rotor geometry
+    rotor_file      = "apc10x7.csv"             # Rotor geometry
+    data_path       = uns.def_data_path         # Path to rotor database
+    pitch           = 0.0                       # (deg) collective pitch of blades
+    CW              = false                     # Clock-wise rotation
+    xfoil           = true                      # Whether to run XFOIL
+    ncrit           = 9                         # Turbulence criterion for XFOIL
+
+    # Discretization
+    n               = N                        # Number of blade elements per blade                             #AFFECTS RESOLUTION
+    r               = 1/5                       # Geometric expansion of elements
+
+    # Read radius of this rotor and number of blades
+    R, B            = uns.read_rotor(rotor_file; data_path=data_path)[[1,3]]
+
+    # ----------------- SIMULATION PARAMETERS --------------------------------------
+
+    # Operating conditions
+    RPM             = 9000                      # RPM
+    J               = 0.3934                       # Advance ratio Vinf/(nD)
+    AOA             = 0                         # (deg) Angle of attack (incidence angle)
+
+    rho             = 1.225                     # (kg/m^3) air density
+    mu              = 1.81e-5                   # (kg/ms) air dynamic viscosity
+    speedofsound    = 342.35                    # (m/s) speed of sound
+
+    magVinf         = J*RPM/60*(2*R)
+    Vinf(X, t)      = magVinf*[cosd(AOA), sind(AOA), 0] # (m/s) freestream velocity vector
+
+    ReD             = 2*pi*RPM/60*R * rho/mu * 2*R      # Diameter-based Reynolds number
+    Matip           = 2*pi*RPM/60*R / speedofsound      # Tip Mach number
+
+    println("""
+        RPM:    $(RPM)
+        Vinf:   $(Vinf(zeros(3), 0)) m/s
+        Matip:  $(round(Matip, digits=3))
+        ReD:    $(round(ReD, digits=0))
+    """)
+
+    # ----------------- SOLVER PARAMETERS ------------------------------------------
+
+    # Aerodynamic solver
+    VehicleType     = uns.UVLMVehicle           # Unsteady solver
+    # VehicleType   = uns.QVLMVehicle           # Quasi-steady solver
+    const_solution  = VehicleType==uns.QVLMVehicle  # Whether to assume that the
+                                                # solution is constant or not
+    # Time parameters
+    nrevs           = 3       #Essential wakelength start with this. keep at 3             # Number of revolutions in simulation
+    nsteps_per_rev  = 140       #time steps. AFFECTS RESOLUTION                # Time steps per revolution                     AFFECTS RESOLUTION
+    nsteps          = const_solution ? 2 : nrevs*nsteps_per_rev # Number of time steps
+    ttot            = nsteps/nsteps_per_rev / (RPM/60)       # (s) total simulation time
+
+    # VPM particle shedding
+    lambda_vpm      = 2.125                     # VPM core overlap
+    p_per_step      = 5      #AFFECTS RESOLUTION                 # Sheds per time step #When changing p_per_step                       AFFECTS RESOLUTION
+    #p_per_step   = Int(ceil((lambda_vpm * 2*pi)/(nsteps_per_rev*(1/n))))                 #when changing other values to make things better.
+    shed_starting   = false  #Was true                    # Whether to shed starting vortex
+    shed_unsteady   = true                      # Whether to shed vorticity from unsteady loading
+    max_particles   = ((2*n+1)*B)*nsteps*p_per_step + 1 # Maximum number of particles
+
+    # Regularization
+    sigma_rotor_surf= R/40                      # Rotor-on-VPM smoothing radius
+    
+                                                # VPM smoothing radius
+    sigma_vpm_overwrite = lambda_vpm * 2*pi*R/(nsteps_per_rev*p_per_step)
+
+    # Rotor solver
+    vlm_rlx         = 0.7                       # VLM relaxation <-- this also applied to rotors
+    hubtiploss_correction = vlm.hubtiploss_nocorrection # Hub and tip loss correction
+
+    # VPM solver
+    vpm_viscous     = vpm.Inviscid()            # VPM viscous diffusion scheme
+    #vpm_viscous     = vpm.CoreSpreading(mu/rho, sigma_vpm_overwrite, vpm.kernel_gaussianerf)             #Given by ben
+
+
+    if VehicleType == uns.QVLMVehicle
+
+        uns.vlm.VLMSolver._mute_warning(true)
+    end
+
+    # ----------------- 1) VEHICLE DEFINITION --------------------------------------
+    println("Generating geometry...")
+
+    # Generate rotor
+    rotor = uns.generate_rotor(rotor_file; pitch=pitch,
+                                            n=n, CW=CW, blade_r=r,
+                                            altReD=[RPM, J, mu/rho],
+                                            xfoil=xfoil,
+                                            ncrit=ncrit,
+                                            data_path=data_path,
+                                            verbose=true,
+                                            verbose_xfoil=false,
+                                            plot_disc=true,
+                                            #spline_s= 0.001 #THIS WAS GIVEN BY CHAT AS I INCREASED N FROM 20 TO 48. MAY BE NEEDED ELSEWHERE
+                                            );
+
+    println("Generating vehicle...")
+
+    # Generate vehicle
+    system = vlm.WingSystem()                   # System of all FLOWVLM objects
+    vlm.addwing(system, "Rotor", rotor)
+
+    rotors = [rotor];                           # Defining this rotor as its own system
+    rotor_systems = (rotors, );                 # All systems of rotors
+
+    wake_system = vlm.WingSystem()              # System that will shed a VPM wake
+                                            # NOTE: Do NOT include rotor when using the quasi-steady solver
+    if VehicleType != uns.QVLMVehicle
+        vlm.addwing(wake_system, "Rotor", rotor)
+    end
+
+    vehicle = VehicleType(   system;
+                                rotor_systems=rotor_systems,
+                                wake_system=wake_system
+                             );
+
+
+
+
+    # ------------- 2) MANEUVER DEFINITION -----------------------------------------
+    # Non-dimensional translational velocity of vehicle over time
+    Vvehicle(t) = zeros(3)
+
+    # Angle of the vehicle over time
+    anglevehicle(t) = zeros(3)
+
+    # RPM control input over time (RPM over `RPMref`)
+    RPMcontrol(t) = 1.0
+
+    angles = ()                                 # Angle of each tilting system (none)
+    RPMs = (RPMcontrol, )                       # RPM of each rotor system
+
+    maneuver = uns.KinematicManeuver(angles, RPMs, Vvehicle, anglevehicle)
+
+
+
+
+    # ------------- 3) SIMULATION DEFINITION ---------------------------------------
+
+    Vref = 0.0                                  # Reference velocity to scale maneuver by
+    RPMref = RPM                                # Reference RPM to scale maneuver by
+
+    Vinit = Vref*Vvehicle(0)                    # Initial vehicle velocity
+    Winit = pi/180*(anglevehicle(1e-6) - anglevehicle(0))/(1e-6*ttot)  # Initial angular velocity
+
+    simulation = uns.Simulation(vehicle, maneuver, Vref, RPMref, ttot;
+                                                    Vinit=Vinit, Winit=Winit);
+
+
+    # ------------- 4) MONITORS DEFINITIONS ----------------------------------------
+    figs, figaxs = [], []                       # Figures generated by monitor
+
+    # Generate rotor monitor
+    monitor_rotor = uns.generate_monitor_rotors(rotors, J, rho, RPM, nsteps;
+                                                t_scale=RPM/60,        # Scaling factor for time in plots
+                                                t_lbl="Revolutions",   # Label for time axis
+                                                out_figs=figs,
+                                                out_figaxs=figaxs,
+                                                save_path=save_path,
+                                                run_name=run_name,
+                                                figname="rotor monitor",
+                                                disp_conv = false #Just look at the csv when finding stuff
+                                                )
+
+
+    # ------------- 5) RUN SIMULATION ----------------------------------------------
+    println("Running simulation...")
+    #//////////////////////////////////////////////////////////////////////////////////////////////////////
+    println("Running simulation $run_id with N = $N (Total steps: $nsteps)...")
+    #///////////////////////////////////////////////////////////////////////////////////////////////////
+
+    uns.run_simulation(simulation, nsteps;
+                        # ----- SIMULATION OPTIONS -------------
+                        Vinf=Vinf,
+                        rho=rho, mu=mu, sound_spd=speedofsound,
+                        # ----- SOLVERS OPTIONS ----------------
+                        p_per_step=p_per_step,
+                        max_particles=max_particles,
+                        vpm_viscous=vpm_viscous,
+                        sigma_vlm_surf=sigma_rotor_surf,
+                        sigma_rotor_surf=sigma_rotor_surf,
+                        sigma_vpm_overwrite=sigma_vpm_overwrite,
+                        vlm_rlx=vlm_rlx,
+                        hubtiploss_correction=hubtiploss_correction,
+                        shed_unsteady=shed_unsteady,
+                        shed_starting=shed_starting,
+                        extra_runtime_function=monitor_rotor,
+                        # ----- OUTPUT OPTIONS ------------------
+                        save_path=save_path,
+                        run_name=run_name,
+                        sigmafactor_vpm = 1.3, #This should be ignored iif sigma vpm override is nothing
+                        #vpm_SFS = vpm.SFS_Cd_twolevel_nobackscatter #Added by ben expensive operation takes a long time to run for mach or bracket error
+                        );
+
+    #/////////////////////////////////////////////////////////////////////////////////////////////////
+    # --- PULL OUT CQ VALUE (f_i) ---
+    # The data is saved to a CSV file.
+    rotor_name    = "Rotor"
+    
+    data_filename = joinpath(save_path, run_name * "_convergence.csv")
+    df = DataFrame(CSV.File(data_filename))
+    
+    # Richardson extrapolation uses the converged solution, which is the last step.
+    # The last step should be nsteps, which is the last row of the DataFrame.
+    f_i = df.CQ_1[end] 
+    
+    println("Final CQ for N=$N is $f_i\n")
+    return f_i
+    #/////////////////////////////////////////////////////////////////////////////////////////////////
+
+end
+
+Cq_experimental = 0.00911957
+
+# ==============================================================================
+# 2. RICHARDSON EXTRAPOLATION CALCULATION
+# ==============================================================================
+
+# Define the consistent resolutions (N1 > N2 > N3) and ratio r=2
+# N_i corresponds to nsteps_per_rev
+N1 = 40
+N2 = 20
+N3 = 10
+r = N1 / N2 # Must be consistent, N1/N2 = N2/N3 = r (r=2 here)
+
+println("--- Starting Richardson Extrapolation (Time Resolution) ---")
+
+# --- Step 2: Run Simulations ---
+f1 = convergence(N1, run_id=1)  # Solution at finest resolution (f_1)
+f2 = convergence(N2, run_id=2)  # Solution at medium resolution (f_2)
+f3 = convergence(N3, run_id=3)  # Solution at coarsest resolution (f_3)
+
+# --- Step 3: Estimate the Observed Order of Accuracy (p) ---
+p = log10(abs((f3 - f2) / (f2 - f1))) / log10(r)
+@printf "Observed Order of Accuracy (p): %.4f\n" p
+
+# --- Step 4: Compute the Extrapolated (Converged) Value (f_exact) ---
+f_exact = f1 + (f1 - f2) / (r^p - 1)
+@printf "Extrapolated (Converged) CQ (f_exact): %.6f\n" f_exact
+
+# --- Convergence Check (Error Estimates) ---
+# Approximate relative error of finest solution f1
+error_f1 = abs((f1 - f_exact) / f_exact) * 100
+@printf "Approximate Relative Error of finest solution (f1=%.6f): %.4f%%\n" f1 error_f1
+
+
+#///////////////////////////Added by me
+error_f2 = abs((f2 - f_exact) / f_exact) * 100
+@printf "Approximate Relative Error of medium solution (f2=%.6f): %.4f%%\n" f2 error_f2
+
+error_f3 = abs((f3 - f_exact) / f_exact) * 100
+@printf "Approximate Relative Error of coursest solution (f3=%.6f): %.4f%%\n" f3 error_f3
+
+
+#//////////////////////////////Error with experimental data
+exp_error_f1 = abs(f1 - Cq_experimental) / Cq_experimental * 100
+exp_error_f2 = abs(f2 - Cq_experimental) / Cq_experimental * 100
+exp_error_f3 = abs(f3 - Cq_experimental) / Cq_experimental * 100
+exp_error_f_exact = abs(f_exact - Cq_experimental) / Cq_experimental * 100
+
+
+# ==============================================================================
+# 5. PREDICT REQUIRED NSTEPS FOR TARGET ACCURACY (1.5%)
+# ==============================================================================
+
+# Target relative error (1.5%)
+epsilon_rel = 0.015 
+
+# Target absolute error
+epsilon_abs = epsilon_rel * abs(f_exact)
+
+# Absolute error of the finest simulation (f1)
+error_f1_abs = abs(f1 - f_exact)
+
+# Predict required Nsteps_per_rev (N_target)
+# N_target = N1 * (error_f1_abs / epsilon_abs)^(1/p)
+
+N_target_float = N1 * (error_f1_abs / epsilon_abs)^(1/p)
+N_target = Int(ceil(N_target_float))
+
+@printf "\n--- Required Resolution Prediction ---"
+@printf "\nTarget Relative Error: %.2f%%" (epsilon_rel * 100)
+@printf "\nPredicted N for convergence (N_target): %d\n" N_target
+
+
+#cqe = 0.00911957
+#e_error = (abs(f_exact-cqe)/cqe) * 100
+
+
+println("N info, nsteps_per_rev= 72, P_per_step (auto) \n") 
+
+
+#///////////////////////////////////////Table?
+println("\n\n--- TIME CONVERGENCE RESULTS ---")
+println("| Resolution | N | Solution (CQ) | Error (%) | Exp. Error (%) |")
+println("|:----------:|:-------------:|:-------------:|:---------:|:--------------:|")
+@printf("| Finest (f1) | %-13d | %.6f | %.4f%% | %.4f%% |\n", N1, f1, error_f1, exp_error_f1)
+@printf("| Medium (f2) | %-13d | %.6f | %.4f%% | %.4f%% |\n", N2, f2, error_f2, exp_error_f2)
+@printf("| Coarsest (f3)| %-13d | %.6f | %.4f%% | %.4f%% |\n", N3, f3, error_f3, exp_error_f3)
+@printf("| Extrapolated | ∞ | %.6f | 0.0000%% | %.4f%% |\n", f_exact, exp_error_f_exact)
+println("\n--- SUMMARY ---")
+@printf("Observed Order of Accuracy (p): %.4f\n", p)
+@printf("Target Relative Error: %.2f%%\n", epsilon_rel*100) # Use your new target
+@printf("Predicted N (N_target): %d\n", N_target) # Use your new prediction
+#@printf("Value from experimental data (Cq): %.4f\n", cqe)
+#@printf("Error between experimental data and extrapolated: %.2f%%\n", e_error)
